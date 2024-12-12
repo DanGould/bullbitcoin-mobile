@@ -13,15 +13,22 @@ class BDKNetwork {
   }) async {
     try {
       final blockchain = await bdk.Blockchain.create(
-        config: bdk.BlockchainConfig.electrum(
-          config: bdk.ElectrumConfig(
-            url: url,
-            retry: retry,
-            timeout: timeout,
+        config: bdk.BlockchainConfig.esplora(
+          config: bdk.EsploraConfig(
+            baseUrl: 'https://mutinynet.com/api',
             stopGap: BigInt.from(stopGap),
-            validateDomain: validateDomain,
+            timeout: BigInt.from(timeout),
           ),
         ),
+        // config: bdk.BlockchainConfig.electrum(
+        //   config: bdk.ElectrumConfig(
+        //     url: url,
+        //     retry: retry,
+        //     timeout: timeout,
+        //     stopGap: BigInt.from(stopGap),
+        //     validateDomain: validateDomain,
+        //   ),
+        // ),
       );
 
       return (blockchain, null);
