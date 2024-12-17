@@ -233,49 +233,6 @@ Future<String?> pollSender(Sender sender) async {
   }
 }
 
-Future<bool> addressExistsInWallet(String address, bdk.Wallet bdkWallet) async {
-  // Get the full address book
-  final addresses = await getAddressBookFromBdkWallet(bdkWallet);
-
-  // Check if the address exists in the list
-  return addresses.any((addr) => addr.address == address);
-}
-
-Future<List<Address>> getAddressBookFromBdkWallet(bdk.Wallet bdkWallet) async {
-  final List<Address> addresses = [];
-
-  // Get last unused address to know how many addresses to check
-  final addressLastUnused = bdkWallet.getAddress(
-    addressIndex: const bdk.AddressIndex.lastUnused(),
-  );
-
-  // Iterate through all addresses up to last unused
-  for (var i = 0; i <= addressLastUnused.index; i++) {
-    final address = bdkWallet.getAddress(
-      addressIndex: bdk.AddressIndex.peek(index: i),
-    );
-    final addressStr = address.address.asString();
-
-    addresses.add(
-      Address(
-        address: addressStr,
-        index: address.index,
-        kind: AddressKind.deposit,
-        state: AddressStatus.unused,
-      ),
-    );
-  }
-
-  // Sort addresses by index descending
-  addresses.sort((a, b) {
-    final int indexA = a.index ?? 0;
-    final int indexB = b.index ?? 0;
-    return indexB.compareTo(indexA);
-  });
-
-  return addresses;
-}
-
 Future<List<UTXO>> getSpendableUtxosFromBdkWallet(
   bdk.Wallet bdkWallet,
   bdk.Network network,
@@ -544,13 +501,9 @@ Future<PayjoinProposal> processPayjoinProposal(
     print('check2');
     // Receive Check 2: original PSBT has no receiver-owned inputs
     final pj2 = await pj1.checkInputsNotOwned(
-      isOwned: (inputScript) async {
-        final address = await bdk.Address.fromScript(
-          script: bdk.ScriptBuf(bytes: inputScript),
-          network: isTestnet ? bdk.Network.testnet : bdk.Network.bitcoin,
-        );
-        return await addressExistsInWallet(address.toString(), wallet);
-      },
+      isOwned: (inputScript) => wallet.isMine(
+        script: bdk.ScriptBuf(bytes: inputScript),
+      ),
     );
     // Receive Check 3: sender inputs have not been seen before (prevent probing attacks)
     print('check3');
@@ -564,13 +517,9 @@ Future<PayjoinProposal> processPayjoinProposal(
     // Identify receiver outputs
     print('check4');
     final pj4 = await pj3.identifyReceiverOutputs(
-      isReceiverOutput: (outputScript) async {
-        final address = await bdk.Address.fromScript(
-          script: bdk.ScriptBuf(bytes: outputScript),
-          network: isTestnet ? bdk.Network.testnet : bdk.Network.bitcoin,
-        );
-        return await addressExistsInWallet(address.toString(), wallet);
-      },
+      isReceiverOutput: (outputScript) => wallet.isMine(
+        script: bdk.ScriptBuf(bytes: outputScript),
+      ),
     );
     final pj5 = await pj4.commitOutputs();
 
