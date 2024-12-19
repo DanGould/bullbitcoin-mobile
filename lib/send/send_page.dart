@@ -99,7 +99,7 @@ class _SendPageState extends State<SendPage> {
       payjoinSessionStorage: locator<PayjoinSessionStorage>(),
       payjoinManager: locator<PayjoinManager>(),
       networkCubit: locator<NetworkCubit>(),
-      networkFeesCubit: locator<NetworkFeesCubit>(),
+      networkFeesCubit: networkFees,
       homeCubit: locator<HomeCubit>(),
       swapBoltz: locator<SwapBoltz>(),
       currencyCubit: currency,
