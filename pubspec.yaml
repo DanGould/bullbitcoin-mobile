@@ -26,7 +26,10 @@ dependencies:
       path: flutter_secure_storage
   path_provider: ^2.1.5
   payjoin:
-    path: ../../rust-payjoin/payjoin-ffi/dart/
+    git:
+      url: https://github.com/payjoin/rust-payjoin
+      ref: 117ce51958974c4893910bec73a47a9f3cade88a
+      path: payjoin-ffi/dart
   qr_flutter: ^4.1.0
   dio: ^5.9.0
   timeago: ^3.7.1
