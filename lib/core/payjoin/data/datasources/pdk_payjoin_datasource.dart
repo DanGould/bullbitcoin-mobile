@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:developer';
 import 'dart:isolate';
 import 'dart:typed_data';
@@ -6,15 +7,12 @@ import 'dart:typed_data';
 import 'package:bb_mobile/core/errors/bull_exception.dart';
 import 'package:bb_mobile/core/payjoin/data/models/payjoin_input_pair_model.dart';
 import 'package:bb_mobile/core/payjoin/data/models/payjoin_model.dart';
-import 'package:bb_mobile/core/utils/bitcoin_tx.dart';
 import 'package:bb_mobile/core/utils/constants.dart';
 import 'package:bb_mobile/core/utils/logger.dart' as logger;
+import 'package:bb_mobile/core/utils/transaction_parsing.dart';
 import 'package:dio/dio.dart';
-import 'package:payjoin_flutter/bitcoin_ffi.dart';
-import 'package:payjoin_flutter/common.dart';
-import 'package:payjoin_flutter/receive.dart';
-import 'package:payjoin_flutter/send.dart';
-import 'package:payjoin_flutter/uri.dart';
+import 'package:payjoin/bitcoin.dart';
+import 'package:payjoin/payjoin_ffi.dart';
 
 class PdkPayjoinDatasource {
   final String _payjoinDirectoryUrl;
@@ -57,11 +55,8 @@ class PdkPayjoinDatasource {
     OhttpKeys? ohttpKeys;
     for (final ohttpRelayUrl in PayjoinConstants.ohttpRelayUrls) {
       try {
-        final relay = await Url.fromStr(ohttpRelayUrl);
-        ohttpKeys = await fetchOhttpKeys(
-          ohttpRelay: ohttpRelayUrl,
-          payjoinDirectory: payjoinDirectory,
-        );
+        final relay = Url.parse(ohttpRelayUrl);
+        ohttpKeys = await fetchOhttpKeys(ohttpRelayUrl, payjoinDirectory);
         ohttpRelay = relay;
         break;
       } catch (e) {
@@ -87,42 +82,32 @@ class PdkPayjoinDatasource {
         throw Exception('All OHTTP relays failed');
       }
 
-      final newReceiver = NewReceiver.create(
-        address: address,
-        network: isTestnet ? Network.testnet : Network.bitcoin,
-        directory: _payjoinDirectoryUrl,
-        ohttpKeys: ohttpKeys,
-        expireAfter: BigInt.from(expireAfterSec),
+      final persister = ReceiverPersisterAdapter();
+      final bitcoinAddress = Address(
+        address,
+        isTestnet ? Network.testnet : Network.bitcoin,
       );
 
-      final imp = InMemoryReceiverPersister();
-      final noOpPersister = DartReceiverPersister(
-        save: (receiver) async {
-          logger.log.info('SAVING RECEIVER');
-          final token = await imp.save(receiver: receiver);
-          return token;
-        },
-        load: (token) async {
-          final receiver = await imp.load(token: token);
-          return receiver;
-        },
-      );
-      final token = await newReceiver.persist(persister: noOpPersister);
+      final initialReceiveTransition =
+          ReceiverBuilder(
+            bitcoinAddress,
+            _payjoinDirectoryUrl,
+            ohttpKeys,
+          ).withExpiration(expireAfterSec).build();
 
-      final receiver = await Receiver.load(
-        token: token,
-        persister: noOpPersister,
-      );
+      final initialized = initialReceiveTransition.save(persister);
 
       // Create and store the model to keep track of the payjoin session
+      // TODO: Get proper ID from the session and ensure it's queryable later on
+      final sessionId = DateTime.now().millisecondsSinceEpoch.toString();
       final model =
           PayjoinModel.receiver(
-                id: receiver.id(),
+                id: sessionId,
                 address: address,
                 isTestnet: isTestnet,
-                receiver: receiver.toJson(),
+                receiver: persister.toJson(),
                 walletId: walletId,
-                pjUri: (await receiver.pjUri()).asString(),
+                pjUri: initialized.pjUri().asString(),
                 maxFeeRateSatPerVb: maxFeeRateSatPerVb,
                 createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
                 expireAfterSec: expireAfterSec,
@@ -148,7 +133,7 @@ class PdkPayjoinDatasource {
     int? expireAfterSec,
   }) async {
     final expirySec = expireAfterSec ?? PayjoinConstants.defaultExpireAfterSec;
-    final uri = await Uri.fromStr(bip21);
+    final uri = Uri.parse(bip21);
 
     PjUri pjUri;
     try {
@@ -157,26 +142,14 @@ class PdkPayjoinDatasource {
       throw NoValidPayjoinBip21Exception(e.toString());
     }
 
-    final minFeeRateSatPerKwu = BigInt.from(networkFeesSatPerVb * 250);
-    final senderBuilder = await SenderBuilder.fromPsbtAndUri(
-      psbtBase64: originalPsbt,
-      pjUri: pjUri,
-    );
-    final newSender = await senderBuilder.buildRecommended(
-      minFeeRate: minFeeRateSatPerKwu,
-    );
-    final imp = InMemorySenderPersister();
-    final persister = DartSenderPersister(
-      save: (sender) async {
-        return await imp.save(sender: sender);
-      },
-      load: (token) async {
-        return await imp.load(token: token);
-      },
-    );
-    final token = await newSender.persist(persister: persister);
-    final sender = await Sender.load(token: token, persister: persister);
-    final senderJson = sender.toJson();
+    final minFeeRateSatPerKwu = (networkFeesSatPerVb * 250).toInt();
+    final persister = SenderPersisterAdapter();
+
+    final initialSendTransition = SenderBuilder(
+      originalPsbt,
+      pjUri,
+    ).buildRecommended(minFeeRateSatPerKwu);
+    final withReplyKey = initialSendTransition.save(persister);
 
     // Create and store the model with the data needed to keep track of the
     //  payjoin session
@@ -184,10 +157,12 @@ class PdkPayjoinDatasource {
         PayjoinModel.sender(
               uri: uri.asString(),
               isTestnet: isTestnet,
-              sender: senderJson,
+              sender: persister.toJson(),
               walletId: walletId,
               originalPsbt: originalPsbt,
-              originalTxId: (await BitcoinTx.fromPsbt(originalPsbt)).txid,
+              originalTxId: await TransactionParsing.getTxIdFromPsbt(
+                originalPsbt,
+              ),
               amountSat: amountSat,
               createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
               expireAfterSec: expirySec,
@@ -207,80 +182,94 @@ class PdkPayjoinDatasource {
     required List<PayjoinInputPairModel> inputPairs,
     required FutureOr<String> Function(String) processPsbt,
   }) async {
-    final receiver = Receiver.fromJson(json: receiverModel.receiver);
-    final request = await getRequest(receiver: receiver, dio: _dio);
+    final persister = ReceiverPersisterAdapter.fromJson(receiverModel.receiver);
 
-    if (request == null) {
-      throw Exception('No request found');
+    final replayResult = replayReceiverEventLog(persister);
+    final receiveSession = replayResult.state();
+
+    UncheckedOriginalPayload request;
+
+    if (receiveSession is InitializedReceiveSession) {
+      final result = await getRequest(
+        receiver: receiveSession.inner,
+        dio: _dio,
+        persister: persister,
+      );
+      if (result == null) {
+        throw Exception('No request found');
+      }
+      request = result;
+    } else if (receiveSession is UncheckedOriginalPayloadReceiveSession) {
+      request = receiveSession.inner;
+    } else {
+      throw Exception(
+        'TODO handle session state: ${receiveSession.runtimeType}',
+      );
     }
 
-    final interactiveReceiver = await request.assumeInteractiveReceiver();
-    final inputsNotOwned = await interactiveReceiver.checkInputsNotOwned(
-      isOwned: hasOwnedInputs,
+    final interactiveReceiver = request.assumeInteractiveReceiver().save(
+      persister,
     );
-    final inputsNotSeen = await inputsNotOwned.checkNoInputsSeenBefore(
-      isKnown: (_) =>
-          false, // Assume the wallet has not seen the inputs since it is an interactive wallet
-    );
-    final receiverOutputs = await inputsNotSeen.identifyReceiverOutputs(
-      isReceiverOutput: hasReceiverOutput,
-    );
-    final committedOutputs = await receiverOutputs.commitOutputs();
+    final inputsNotOwned = interactiveReceiver
+        .checkInputsNotOwned(IsScriptOwnedCallback(hasOwnedInputs))
+        .save(persister);
+    final inputsNotSeen = inputsNotOwned
+        .checkNoInputsSeenBefore(
+          // Assume the wallet has not seen the inputs since it is an interactive wallet
+          IsOutputKnownCallback((_) => false),
+        )
+        .save(persister);
+    final receiverOutputs = inputsNotSeen
+        .identifyReceiverOutputs(IsScriptOwnedCallback(hasReceiverOutput))
+        .save(persister);
+    final committedOutputs = receiverOutputs.commitOutputs().save(persister);
 
-    final candidateInputs = await Future.wait(
-      inputPairs.map(
-        (input) async => await InputPair.newInstance(
-          txin: TxIn(
-            previousOutput: OutPoint(txid: input.txId, vout: input.vout),
-            scriptSig: await Script.newInstance(
-              rawOutputScript: input.scriptSigRawOutputScript,
-            ),
-            sequence: input.sequence,
-            witness: input.witness,
-          ),
-          psbtin: PsbtInput(
-            witnessUtxo: TxOut(
-              value: input.value!,
-              scriptPubkey: input.scriptPubkey,
-            ),
-            redeemScript: input.redeemScriptRawOutputScript.isEmpty
-                ? null
-                : await Script.newInstance(
-                    rawOutputScript: input.redeemScriptRawOutputScript,
+    final candidateInputs =
+        inputPairs
+            .map(
+              (input) => InputPair(
+                TxIn(
+                  OutPoint(input.txId, input.vout),
+                  Script(input.scriptSigRawOutputScript as Uint8List),
+                  input.sequence,
+                  input.witness,
+                ),
+                PsbtInput(
+                  TxOut(
+                    Amount.fromSat(input.value!.toInt()),
+                    Script(input.scriptPubkey),
                   ),
-            witnessScript: input.witnessScriptRawOutputScript.isEmpty
-                ? null
-                : await Script.newInstance(
-                    rawOutputScript: input.witnessScriptRawOutputScript,
-                  ),
-          ),
-        ),
-      ),
-    );
+                  input.redeemScriptRawOutputScript.isEmpty
+                      ? null
+                      : Script(input.redeemScriptRawOutputScript as Uint8List),
+                  input.witnessScriptRawOutputScript.isEmpty
+                      ? null
+                      : Script(input.witnessScriptRawOutputScript as Uint8List),
+                ),
+                null,
+              ),
+            )
+            .toList();
 
     // Try to select a privacy preserving input pair, else just stick with the
     //  first possible input pair.
     InputPair inputPair = candidateInputs.first;
     try {
-      inputPair = await committedOutputs.tryPreservingPrivacy(
-        candidateInputs: candidateInputs,
-      );
+      inputPair = committedOutputs.tryPreservingPrivacy(candidateInputs);
     } catch (e) {
       logger.log.severe(
-        message: 'Failed to preserve privacy: Using first input pair.',
-        error: e,
-        trace: StackTrace.current,
+        'Failed to preserve privacy: $e. Using first input pair.',
       );
     }
 
-    final inputsContributed = await committedOutputs.contributeInputs(
-      replacementInputs: [inputPair],
-    );
-    final inputsCommitted = await inputsContributed.commitInputs();
-    final proposal = await inputsCommitted.finalizeProposal(
-      processPsbt: processPsbt,
-      maxFeeRateSatPerVb: receiverModel.maxFeeRateSatPerVb,
-    );
+    final inputsContributed = committedOutputs.contributeInputs([inputPair]);
+    final inputsCommitted = inputsContributed.commitInputs().save(persister);
+    final feesApplied = inputsCommitted
+        .applyFeeRange(null, receiverModel.maxFeeRateSatPerVb.toInt())
+        .save(persister);
+    final proposal = feesApplied
+        .finalizeProposal(ProcessPsbtCallback(processPsbt))
+        .save(persister);
 
     // Now that the request is processed and the proposal is ready, send it to
     //  the sender through the payjoin directory
@@ -288,16 +277,16 @@ class PdkPayjoinDatasource {
 
     // Update the model with the proposal psbt so it can be known a proposal has
     //  been sent
-    final proposalPsbt = await proposal.psbt();
+    final proposalPsbt = proposal.psbt();
 
     final updatedModel = receiverModel.copyWith(
-      receiver: receiver.toJson(),
+      receiver: persister.toJson(),
       proposalPsbt: proposalPsbt,
-      txId: (await BitcoinTx.fromPsbt(proposalPsbt)).txid,
+      txId: await TransactionParsing.getTxIdFromPsbt(proposalPsbt),
     );
 
     logger.log.info(
-      'Payjoin request processed and proposal sent for ${receiver.id()}: $proposalPsbt',
+      'Payjoin request processed and proposal sent: $proposalPsbt',
     );
 
     return updatedModel;
@@ -389,8 +378,6 @@ class PdkPayjoinDatasource {
 
   static Future<void> _receiversIsolateEntryPoint(SendPort sendPort) async {
     log('[Receivers Isolate] Started _receiversIsolateEntryPoint');
-    // Initialize core library in the isolate too for the native pdk library
-    await PConfig.initializeApp();
 
     final receivePort = ReceivePort();
     sendPort.send(receivePort.sendPort);
@@ -403,41 +390,57 @@ class PdkPayjoinDatasource {
       final receiverModel = PayjoinReceiverModel.fromJson(
         data as Map<String, dynamic>,
       );
-      final receiver = Receiver.fromJson(json: receiverModel.receiver);
+      final persister = ReceiverPersisterAdapter.fromJson(
+        receiverModel.receiver,
+      );
+      final replayResult = replayReceiverEventLog(persister);
+      final receiveSession = replayResult.state();
+      if (receiveSession is! InitializedReceiveSession) {
+        log(
+          '[Receivers Isolate] Expected InitializedReceiveSession but got ${receiveSession.runtimeType}',
+        );
+        return;
+      }
+      final receiver = receiveSession.inner;
 
       // Start checking for a payjoin request from the sender periodically
-      Timer.periodic(const Duration(seconds: PayjoinConstants.directoryPollingInterval), (
-        Timer timer,
-      ) async {
-        log(
-          '[Receivers Isolate] Checking for request in receivers isolate for '
-          '${receiver.id()}',
-        );
+      const interval = Duration(
+        seconds: PayjoinConstants.directoryPollingInterval,
+      );
+      Timer.periodic(interval, (Timer timer) async {
+        log('[Receivers Isolate] Checking for request in receivers isolate');
         try {
-          final request = await getRequest(receiver: receiver, dio: dio);
+          final request = await getRequest(
+            receiver: receiver,
+            dio: dio,
+            persister: persister,
+          );
           if (request != null) {
-            requests.putIfAbsent(receiver.id(), () async {
-              log(
-                '[Receivers Isolate] Request found in receivers isolate for '
-                '${receiver.id()}',
-              );
+            requests.putIfAbsent(receiver.pjUri().asString(), () async {
+              log('[Receivers Isolate] Request found in receivers isolate');
               // The original tx bytes are needed in the main isolate for
               //  further processing so extract them here and pass them through
               //  the model
-              final originalTxBytes = await request
-                  .extractTxToScheduleBroadcast();
-              final originalTx = await BitcoinTx.fromBytes(originalTxBytes);
-              final originalTxId = originalTx.txid;
-              final amountSat = await originalTx.getAmountReceived(
-                address: receiverModel.address,
-                isTestnet: receiverModel.isTestnet,
+              final extractable = request.assumeInteractiveReceiver().save(
+                persister,
               );
+              final originalTxBytes =
+                  extractable.extractTxToScheduleBroadcast();
+              final originalTxId =
+                  await TransactionParsing.getTxIdFromTransactionBytes(
+                    originalTxBytes,
+                  );
+              final amountSat =
+                  await TransactionParsing.getAmountReceivedFromTransactionBytes(
+                    originalTxBytes,
+                    address: receiverModel.address,
+                    isTestnet: receiverModel.isTestnet,
+                  );
               log(
-                '[Receivers Isolate] Request original Tx ID: $originalTxId and amount: $amountSat for '
-                '${receiver.id()}',
+                '[Receivers Isolate] Request original Tx ID: $originalTxId and amount: $amountSat',
               );
               final updatedModel = receiverModel.copyWith(
-                receiver: receiver.toJson(),
+                receiver: persister.toJson(),
                 originalTxBytes: originalTxBytes,
                 originalTxId: originalTxId,
                 amountSat: amountSat,
@@ -447,25 +450,17 @@ class PdkPayjoinDatasource {
               sendPort.send(updatedModel.toJson());
 
               // Cancel the timer since the request has been received
-              log(
-                '[Receivers Isolate] cancelling timer in receivers isolate for ${receiver.id()}',
-              );
+              log('[Receivers Isolate] cancelling timer in receivers isolate');
               timer.cancel();
-              log(
-                '[Receivers Isolate] timer cancelled in receivers isolate for ${receiver.id()}',
-              );
+              log('[Receivers Isolate] timer cancelled in receivers isolate');
             });
           } else {
             log(
-              '[Receivers Isolate] No valid request found in receivers isolate for '
-              '${receiver.id()}',
+              '[Receivers Isolate] No valid request found in receivers isolate',
             );
           }
         } catch (e) {
-          log(
-            '[Receivers Isolate] periodic timer get request exception: $e for '
-            '${receiver.id()}',
-          );
+          log('[Receivers Isolate] periodic timer get request exception: $e');
           if (e is PayjoinExpiredException) {
             // If the request returns an expiry error, mark the receiver as
             //  expired and notify the main isolate so it stops polling
@@ -480,8 +475,6 @@ class PdkPayjoinDatasource {
 
   static Future<void> _sendersIsolateEntryPoint(SendPort sendPort) async {
     log('[Senders Isolate] Started _sendersIsolateEntryPoint');
-    // Initialize core library in the isolate too for the native pdk library
-    await PConfig.initializeApp();
 
     final receivePort = ReceivePort();
     sendPort.send(receivePort.sendPort);
@@ -494,11 +487,24 @@ class PdkPayjoinDatasource {
         final senderModel = PayjoinSenderModel.fromJson(
           data as Map<String, dynamic>,
         );
-        final sender = Sender.fromJson(json: senderModel.sender);
+        final persister = SenderPersisterAdapter.fromJson(senderModel.sender);
+
+        final replayResult = replaySenderEventLog(persister);
+        final sendSession = replayResult.state();
+
+        if (sendSession is! WithReplyKeySendSession) {
+          log(
+            '[Senders Isolate] Expected WithReplyKeySendSession but got ${sendSession.runtimeType}',
+          );
+          return;
+        }
+
+        final sender = sendSession.inner;
         log('[Senders Isolate] Requesting payjoin...');
         final context = await PdkPayjoinDatasource.request(
           sender: sender,
           dio: dio,
+          persister: persister,
         );
         log('[Senders Isolate] Payjoin requested.');
 
@@ -511,16 +517,18 @@ class PdkPayjoinDatasource {
               final proposalPsbt = await PdkPayjoinDatasource.getProposalPsbt(
                 context: context,
                 dio: dio,
+                persister: persister,
               );
 
               if (proposalPsbt != null) {
                 log('[Senders Isolate] Proposal found in senders isolate');
-                final txId = (await BitcoinTx.fromPsbt(proposalPsbt)).txid;
+                final psbtStr = proposalPsbt.serializeBase64();
+                final txId = await TransactionParsing.getTxIdFromPsbt(psbtStr);
                 // The proposal psbt is needed in the main isolate for
                 //  further processing so send it through the model as well as
                 //  its txId.
                 final updatedModel = senderModel.copyWith(
-                  proposalPsbt: proposalPsbt,
+                  proposalPsbt: psbtStr,
                   txId: txId,
                 );
 
@@ -549,24 +557,24 @@ class PdkPayjoinDatasource {
     });
   }
 
-  static Future<UncheckedProposal?> getRequest({
-    required Receiver receiver,
+  static Future<UncheckedOriginalPayload?> getRequest({
+    required Initialized receiver,
     required Dio dio,
+    required ReceiverPersisterAdapter persister,
   }) async {
     // The use of ffiError here is a hack, we should change it once payjoin-flutter
     //  exposes different exceptions for specific errors
     Object? ffiError;
     try {
-      receiver.id();
-      (Request, ClientResponse)? request;
+      RequestResponse? request;
       for (final ohttpRelay in PayjoinConstants.ohttpRelayUrls) {
         try {
-          request = await receiver.extractReq(ohttpRelay: ohttpRelay);
+          request = receiver.createPollRequest(ohttpRelay);
           ffiError = null;
-          log('[${receiver.id()}] receiver extractReq success');
+          log('receiver extractReq success');
           break;
         } catch (e) {
-          log('[${receiver.id()}] receiver extractReq exception: $e');
+          log('receiver extractReq exception: $e');
           ffiError = e;
           continue;
         }
@@ -576,30 +584,31 @@ class PdkPayjoinDatasource {
         if (ffiError != null) {
           throw ffiError;
         }
-        throw PayjoinNotFoundException(
-          '[${receiver.id()}] No payjoin request found',
-        );
+        throw PayjoinNotFoundException('No payjoin request found');
       }
 
-      log('[${receiver.id()}] request != null');
-      final (req, context) = request;
+      log('request != null');
+      final (req, context) = (request.request, request.clientResponse);
       final ohttpResponse = await dio.post(
-        req.url.asString(),
+        req.url,
         data: req.body,
         options: Options(
           headers: {'Content-Type': req.contentType},
           responseType: ResponseType.bytes,
         ),
       );
-      log('[${receiver.id()}] processing request...');
-      final proposal = await receiver.processRes(
-        body: ohttpResponse.data as List<int>,
-        ctx: context,
-      );
-      log('[${receiver.id()}] request processed');
-      return proposal;
+      log('processing request...');
+      final proposal = receiver
+          .processResponse(ohttpResponse.data as Uint8List, context)
+          .save(persister);
+      log('request processed');
+      if (proposal is ProgressInitializedTransitionOutcome) {
+        return proposal.inner;
+      } else {
+        return null;
+      }
     } catch (e) {
-      log('[${receiver.id()}] getRequest exception: $e');
+      log('getRequest exception: $e');
       if (e == ffiError) {
         // TODO: Check for the correct error.
         //  We just assume the error is an expired error for now.
@@ -612,10 +621,10 @@ class PdkPayjoinDatasource {
   }
 
   Future<void> _sendPayjoinProposal(PayjoinProposal proposal) async {
-    (Request, ClientResponse)? request;
+    RequestResponse? request;
     for (final ohttpRelayUrl in PayjoinConstants.ohttpRelayUrls) {
       try {
-        request = await proposal.extractReq(ohttpRelay: ohttpRelayUrl);
+        request = proposal.createPostRequest(ohttpRelayUrl);
         break;
       } catch (e) {
         log('proposal extractReq exception: $e with relay $ohttpRelayUrl');
@@ -626,35 +635,31 @@ class PdkPayjoinDatasource {
       throw PayjoinNotFoundException('No payjoin proposal found');
     }
 
-    final (req, ohttpCtx) = request;
+    final (req, ohttpCtx) = (request.request, request.clientResponse);
     final res = await _dio.post(
-      req.url.asString(),
+      req.url,
       data: req.body,
       options: Options(
         headers: {'Content-Type': req.contentType},
         responseType: ResponseType.bytes,
       ),
     );
-    await proposal.processRes(
-      res: res.data as List<int>,
-      ohttpContext: ohttpCtx,
-    );
+    proposal.processResponse(res.data as Uint8List, ohttpCtx);
   }
 
-  static Future<V2GetContext> request({
-    required Sender sender,
+  static Future<PollingForProposal> request({
+    required WithReplyKey sender,
     required Dio dio,
+    required SenderPersisterAdapter persister,
   }) async {
-    (Request, V2PostContext)? result;
+    RequestOhttpContext? result;
 
     for (final ohttpProxyUrl in PayjoinConstants.ohttpRelayUrls) {
       try {
         log(
           '[Senders Isolate] Extracting V2 request from sender with relay: $ohttpProxyUrl',
         );
-        result = await sender.extractV2(
-          ohttpProxyUrl: await Url.fromStr(ohttpProxyUrl),
-        );
+        result = sender.createV2PostRequest(ohttpProxyUrl);
         break;
       } catch (e) {
         final msg = (e as dynamic).msg ?? e.toString();
@@ -669,40 +674,43 @@ class PdkPayjoinDatasource {
       throw Exception('All OHTTP relays failed');
     }
 
-    final (req, context) = result;
+    final (req, context) = (result.request, result.ohttpCtx);
 
-    log('[Senders Isolate] Sending V2 request to ${req.url.asString()}');
+    log('[Senders Isolate] Sending V2 request to ${req.url}');
     final res = await dio.post(
-      req.url.asString(),
+      req.url,
       data: req.body,
       options: Options(
         headers: {'Content-Type': req.contentType},
         responseType: ResponseType.bytes,
       ),
     );
-    log('[Senders Isolate] Received response from ${req.url.asString()}');
+    log('[Senders Isolate] Received response from ${req.url}');
 
-    final getCtx = await context.processResponse(
-      response: res.data as List<int>,
+    final pollingForProposal = sender
+        .processResponse(res.data as Uint8List, context)
+        .save(persister);
+
+    log(
+      '[Senders Isolate] Processed response for V2 request: $pollingForProposal ',
     );
 
-    log('[Senders Isolate] Processed response for V2 request: $getCtx');
-
-    return getCtx;
+    return pollingForProposal;
   }
 
-  static Future<String?> getProposalPsbt({
-    required V2GetContext context,
+  static Future<Psbt?> getProposalPsbt({
+    required PollingForProposal context,
     required Dio dio,
+    required SenderPersisterAdapter persister,
   }) async {
     // The use of ffiError here is a hack, we should change it once payjoin-flutter
     //  exposes different exceptions for specific errors
     Object? ffiError;
     try {
-      (Request, ClientResponse)? result;
+      RequestOhttpContext? result;
       for (final ohttpRelay in PayjoinConstants.ohttpRelayUrls) {
         try {
-          result = await context.extractReq(ohttpRelay: ohttpRelay);
+          result = context.createPollRequest(ohttpRelay);
           ffiError = null;
           log(
             'context extract request success: $result with relay $ohttpRelay',
@@ -722,10 +730,10 @@ class PdkPayjoinDatasource {
         throw Exception('All OHTTP relays failed');
       }
 
-      final (req, reqCtx) = result;
+      final (req, reqCtx) = (result.request, result.ohttpCtx);
 
       final res = await dio.post(
-        req.url.asString(),
+        req.url,
         data: req.body,
         options: Options(
           headers: {'Content-Type': req.contentType},
@@ -733,12 +741,15 @@ class PdkPayjoinDatasource {
         ),
       );
 
-      final proposalPsbt = await context.processResponse(
-        response: res.data as List<int>,
-        ohttpCtx: reqCtx,
-      );
+      final proposalPsbt = context
+          .processResponse(res.data as Uint8List, reqCtx)
+          .save(persister);
 
-      return proposalPsbt;
+      if (proposalPsbt is ProgressPollingForProposalTransitionOutcome) {
+        return proposalPsbt.inner;
+      } else {
+        return null;
+      }
     } catch (e) {
       log('getProposalPsbt exception: $e');
       if (e == ffiError) {
@@ -751,51 +762,128 @@ class PdkPayjoinDatasource {
   }
 }
 
-class InMemoryReceiverPersister {
-  final Map<String, Receiver> _store = {};
+/// Temporary adapters for payjoin receiver and sender session persistence.
+///
+/// This adapter bridges the gap between the old payjoin_flutter API (which required
+/// full object serialization) and the new payjoin_dart API (which uses session events).
+/// It implements JsonReceiverSessionPersister by storing session events in memory.
+///
+/// Events are also persisted as JSON in the existing PayjoinModel.receiver field
+/// and database. This is a hack but allows upgrading the payjoin dependency without
+/// any database schema changes.
+class ReceiverPersisterAdapter implements JsonReceiverSessionPersister {
+  final List<String> _events = [];
 
-  Future<ReceiverToken> save({required Receiver receiver}) async {
-    final token = receiver.key();
-    _store[token.toBytes().toString()] = receiver;
-    return token;
+  @override
+  void save(String event) {
+    _events.add(event);
   }
 
-  Future<Receiver> load({required ReceiverToken token}) async {
-    logger.log.info('LOADING RECEIVER');
-    final receiver = _store[token.toBytes().toString()];
-    if (receiver == null) {
-      throw Exception('Receiver not found for the provided token.');
-    }
-    return receiver;
+  @override
+  List<String> load() {
+    return _events;
+  }
+
+  @override
+  void close() {
+    // No-op for now
+  }
+
+  String toJson() {
+    return jsonEncode(_events);
+  }
+
+  static ReceiverPersisterAdapter fromJson(String json) {
+    final adapter = ReceiverPersisterAdapter();
+    final events = jsonDecode(json) as List<dynamic>;
+    adapter._events.addAll(events.cast<String>());
+    return adapter;
   }
 }
 
-class InMemorySenderPersister implements DartSenderPersister {
-  final Map<String, Sender> _store = {};
+class SenderPersisterAdapter implements JsonSenderSessionPersister {
+  final List<String> _events = [];
 
-  Future<SenderToken> save({required Sender sender}) async {
-    final token = sender.key();
-    logger.log.info('TOKEN SAVE}');
-    _store[token.toBytes().toString()] = sender;
-    return token;
+  @override
+  void save(String event) {
+    _events.add(event);
   }
 
-  Future<Sender> load({required SenderToken token}) async {
-    logger.log.info('TOKEN LOAD}');
-    final sender = _store[token.toBytes().toString()];
-    if (sender == null) {
-      throw Exception('Sender not found for the provided token.');
+  @override
+  List<String> load() {
+    return _events;
+  }
+
+  @override
+  void close() {
+    // No-op for now
+  }
+
+  String toJson() {
+    return jsonEncode(_events);
+  }
+
+  static SenderPersisterAdapter fromJson(String json) {
+    final adapter = SenderPersisterAdapter();
+    final events = jsonDecode(json) as List<dynamic>;
+    adapter._events.addAll(events.cast<String>());
+    return adapter;
+  }
+}
+
+// These callback wrappers convert async functions to sync
+class IsScriptOwnedCallback implements IsScriptOwned {
+  final FutureOr<bool> Function(Uint8List) _callback;
+
+  IsScriptOwnedCallback(this._callback);
+
+  @override
+  bool callback(Uint8List script) {
+    final result = _callback(script);
+    if (result is Future<bool>) {
+      final completer = Completer<bool>();
+      result.then(completer.complete).catchError(completer.completeError);
+      while (!completer.isCompleted) {}
+      return completer.future as bool;
     }
-    return sender;
+    return result;
   }
+}
+
+class IsOutputKnownCallback implements IsOutputKnown {
+  final FutureOr<bool> Function(dynamic) _callback;
+
+  IsOutputKnownCallback(this._callback);
 
   @override
-  void dispose() {
-    _store.clear();
+  bool callback(OutPoint outpoint) {
+    final result = _callback(outpoint);
+    if (result is Future<bool>) {
+      final completer = Completer<bool>();
+      result.then(completer.complete).catchError(completer.completeError);
+      while (!completer.isCompleted) {}
+      return completer.future as bool;
+    }
+    return result;
   }
+}
+
+class ProcessPsbtCallback implements ProcessPsbt {
+  final FutureOr<String> Function(String) _callback;
+
+  ProcessPsbtCallback(this._callback);
 
   @override
-  bool get isDisposed => _store.isEmpty;
+  String callback(String psbt) {
+    final result = _callback(psbt);
+    if (result is Future<String>) {
+      final completer = Completer<String>();
+      result.then(completer.complete).catchError(completer.completeError);
+      while (!completer.isCompleted) {}
+      return completer.future as String;
+    }
+    return result;
+  }
 }
 
 class PayjoinNotFoundException extends BullException {
