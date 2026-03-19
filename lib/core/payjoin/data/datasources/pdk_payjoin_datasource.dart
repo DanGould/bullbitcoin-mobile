@@ -9,10 +9,9 @@ import 'package:bb_mobile/core/payjoin/data/models/payjoin_input_pair_model.dart
 import 'package:bb_mobile/core/payjoin/data/models/payjoin_model.dart';
 import 'package:bb_mobile/core/utils/constants.dart';
 import 'package:bb_mobile/core/utils/logger.dart' as logger;
-import 'package:bb_mobile/core/utils/transaction_parsing.dart';
+import 'package:bb_mobile/core/utils/bitcoin_tx.dart';
 import 'package:dio/dio.dart';
-import 'package:payjoin/bitcoin.dart';
-import 'package:payjoin/payjoin_ffi.dart';
+import 'package:payjoin/payjoin.dart' as pj;
 
 class PdkPayjoinDatasource {
   final String _payjoinDirectoryUrl;
@@ -48,16 +47,27 @@ class PdkPayjoinDatasource {
 
   Stream<PayjoinModel> get expiredPayjoins => _expiredController.stream;
 
-  Future<(OhttpKeys?, Url?)> fetchOhttpKeyAndRelay({
+  /// Fetch OHTTP keys by making an HTTP GET to the payjoin directory,
+  /// then decoding the response bytes with OhttpKeys.decode().
+  ///
+  /// The old `fetchOhttpKeys()` top-level function no longer exists in the
+  /// public API; it was a test-only utility.
+  Future<(pj.OhttpKeys?, String?)> fetchOhttpKeyAndRelay({
     required String payjoinDirectory,
   }) async {
-    Url? ohttpRelay;
-    OhttpKeys? ohttpKeys;
+    String? ohttpRelay;
+    pj.OhttpKeys? ohttpKeys;
+    final dio = Dio();
     for (final ohttpRelayUrl in PayjoinConstants.ohttpRelayUrls) {
       try {
-        final relay = Url.parse(ohttpRelayUrl);
-        ohttpKeys = await fetchOhttpKeys(ohttpRelayUrl, payjoinDirectory);
-        ohttpRelay = relay;
+        // Fetch OHTTP keys from the directory via the relay
+        final response = await dio.get(
+          '$payjoinDirectory/ohttp-keys',
+          options: Options(responseType: ResponseType.bytes),
+        );
+        final bytes = response.data as List<int>;
+        ohttpKeys = pj.OhttpKeys.decode(bytes: Uint8List.fromList(bytes));
+        ohttpRelay = ohttpRelayUrl;
         break;
       } catch (e) {
         continue;
@@ -83,19 +93,19 @@ class PdkPayjoinDatasource {
       }
 
       final persister = ReceiverPersisterAdapter();
-      final bitcoinAddress = Address(
-        address,
-        isTestnet ? Network.testnet : Network.bitcoin,
-      );
 
+      // ReceiverBuilder takes a string address directly (no Address wrapper)
       final initialReceiveTransition =
-          ReceiverBuilder(
-            bitcoinAddress,
-            _payjoinDirectoryUrl,
-            ohttpKeys,
-          ).withExpiration(expireAfterSec).build();
+          pj.ReceiverBuilder(
+            address: address,
+            directory: _payjoinDirectoryUrl,
+            ohttpKeys: ohttpKeys,
+          )
+          .withExpiration(expiration: expireAfterSec)
+          .build()
+          .save(persister: persister);
 
-      final initialized = initialReceiveTransition.save(persister);
+      final initialized = initialReceiveTransition;
 
       // Create and store the model to keep track of the payjoin session
       // TODO: Get proper ID from the session and ensure it's queryable later on
@@ -133,9 +143,9 @@ class PdkPayjoinDatasource {
     int? expireAfterSec,
   }) async {
     final expirySec = expireAfterSec ?? PayjoinConstants.defaultExpireAfterSec;
-    final uri = Uri.parse(bip21);
+    final uri = pj.Uri.parse(uri: bip21);
 
-    PjUri pjUri;
+    pj.PjUri pjUri;
     try {
       pjUri = uri.checkPjSupported();
     } catch (e) {
@@ -145,11 +155,11 @@ class PdkPayjoinDatasource {
     final minFeeRateSatPerKwu = (networkFeesSatPerVb * 250).toInt();
     final persister = SenderPersisterAdapter();
 
-    final initialSendTransition = SenderBuilder(
-      originalPsbt,
-      pjUri,
-    ).buildRecommended(minFeeRateSatPerKwu);
-    final withReplyKey = initialSendTransition.save(persister);
+    final initialSendTransition = pj.SenderBuilder(
+      psbt: originalPsbt,
+      uri: pjUri,
+    ).buildRecommended(minFeeRate: minFeeRateSatPerKwu);
+    initialSendTransition.save(persister: persister);
 
     // Create and store the model with the data needed to keep track of the
     //  payjoin session
@@ -160,9 +170,7 @@ class PdkPayjoinDatasource {
               sender: persister.toJson(),
               walletId: walletId,
               originalPsbt: originalPsbt,
-              originalTxId: await TransactionParsing.getTxIdFromPsbt(
-                originalPsbt,
-              ),
+              originalTxId: await _getTxIdFromPsbt(originalPsbt),
               amountSat: amountSat,
               createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
               expireAfterSec: expirySec,
@@ -184,12 +192,12 @@ class PdkPayjoinDatasource {
   }) async {
     final persister = ReceiverPersisterAdapter.fromJson(receiverModel.receiver);
 
-    final replayResult = replayReceiverEventLog(persister);
+    final replayResult = pj.replayReceiverEventLog(persister: persister);
     final receiveSession = replayResult.state();
 
-    UncheckedOriginalPayload request;
+    pj.UncheckedOriginalPayload request;
 
-    if (receiveSession is InitializedReceiveSession) {
+    if (receiveSession is pj.InitializedReceiveSession) {
       final result = await getRequest(
         receiver: receiveSession.inner,
         dio: _dio,
@@ -199,7 +207,7 @@ class PdkPayjoinDatasource {
         throw Exception('No request found');
       }
       request = result;
-    } else if (receiveSession is UncheckedOriginalPayloadReceiveSession) {
+    } else if (receiveSession is pj.UncheckedOriginalPayloadReceiveSession) {
       request = receiveSession.inner;
     } else {
       throw Exception(
@@ -208,72 +216,86 @@ class PdkPayjoinDatasource {
     }
 
     final interactiveReceiver = request.assumeInteractiveReceiver().save(
-      persister,
+      persister: persister,
     );
     final inputsNotOwned = interactiveReceiver
-        .checkInputsNotOwned(IsScriptOwnedCallback(hasOwnedInputs))
-        .save(persister);
+        .checkInputsNotOwned(isOwned: IsScriptOwnedCallback(hasOwnedInputs))
+        .save(persister: persister);
     final inputsNotSeen = inputsNotOwned
         .checkNoInputsSeenBefore(
           // Assume the wallet has not seen the inputs since it is an interactive wallet
-          IsOutputKnownCallback((_) => false),
+          isKnown: IsOutputKnownCallback((_) => false),
         )
-        .save(persister);
+        .save(persister: persister);
     final receiverOutputs = inputsNotSeen
-        .identifyReceiverOutputs(IsScriptOwnedCallback(hasReceiverOutput))
-        .save(persister);
-    final committedOutputs = receiverOutputs.commitOutputs().save(persister);
+        .identifyReceiverOutputs(isReceiverOutput: IsScriptOwnedCallback(hasReceiverOutput))
+        .save(persister: persister);
+    final committedOutputs = receiverOutputs.commitOutputs().save(persister: persister);
 
     final candidateInputs =
         inputPairs
             .map(
-              (input) => InputPair(
-                TxIn(
-                  OutPoint(input.txId, input.vout),
-                  Script(input.scriptSigRawOutputScript as Uint8List),
-                  input.sequence,
-                  input.witness,
-                ),
-                PsbtInput(
-                  TxOut(
-                    Amount.fromSat(input.value!.toInt()),
-                    Script(input.scriptPubkey),
+              (input) => pj.InputPair(
+                txin: pj.PlainTxIn(
+                  previousOutput: pj.PlainOutPoint(
+                    txid: input.txId,
+                    vout: input.vout,
                   ),
-                  input.redeemScriptRawOutputScript.isEmpty
-                      ? null
-                      : Script(input.redeemScriptRawOutputScript as Uint8List),
-                  input.witnessScriptRawOutputScript.isEmpty
-                      ? null
-                      : Script(input.witnessScriptRawOutputScript as Uint8List),
+                  scriptSig: Uint8List.fromList(input.scriptSigRawOutputScript),
+                  sequence: input.sequence,
+                  witness: input.witness,
                 ),
-                null,
+                psbtin: pj.PlainPsbtInput(
+                  witnessUtxo: input.value != null
+                      ? pj.PlainTxOut(
+                          valueSat: input.value!.toInt(),
+                          scriptPubkey: input.scriptPubkey,
+                        )
+                      : null,
+                  redeemScript: input.redeemScriptRawOutputScript.isEmpty
+                      ? null
+                      : Uint8List.fromList(input.redeemScriptRawOutputScript),
+                  witnessScript: input.witnessScriptRawOutputScript.isEmpty
+                      ? null
+                      : Uint8List.fromList(input.witnessScriptRawOutputScript),
+                ),
+                expectedWeight: null,
               ),
             )
             .toList();
 
     // Try to select a privacy preserving input pair, else just stick with the
     //  first possible input pair.
-    InputPair inputPair = candidateInputs.first;
+    pj.InputPair inputPair = candidateInputs.first;
     try {
-      inputPair = committedOutputs.tryPreservingPrivacy(candidateInputs);
+      inputPair = committedOutputs.tryPreservingPrivacy(
+        candidateInputs: candidateInputs,
+      );
     } catch (e) {
       logger.log.severe(
-        'Failed to preserve privacy: $e. Using first input pair.',
+        message: 'Failed to preserve privacy: $e. Using first input pair.',
+        error: e,
+        trace: StackTrace.current,
       );
     }
 
-    final inputsContributed = committedOutputs.contributeInputs([inputPair]);
-    final inputsCommitted = inputsContributed.commitInputs().save(persister);
+    final inputsContributed = committedOutputs.contributeInputs(
+      replacementInputs: [inputPair],
+    );
+    final inputsCommitted = inputsContributed.commitInputs().save(persister: persister);
     final feesApplied = inputsCommitted
-        .applyFeeRange(null, receiverModel.maxFeeRateSatPerVb.toInt())
-        .save(persister);
+        .applyFeeRange(
+          minFeeRateSatPerVb: null,
+          maxEffectiveFeeRateSatPerVb: receiverModel.maxFeeRateSatPerVb.toInt(),
+        )
+        .save(persister: persister);
     final proposal = feesApplied
-        .finalizeProposal(ProcessPsbtCallback(processPsbt))
-        .save(persister);
+        .finalizeProposal(processPsbt: ProcessPsbtCallback(processPsbt))
+        .save(persister: persister);
 
     // Now that the request is processed and the proposal is ready, send it to
     //  the sender through the payjoin directory
-    await _sendPayjoinProposal(proposal);
+    await _sendPayjoinProposal(proposal, persister);
 
     // Update the model with the proposal psbt so it can be known a proposal has
     //  been sent
@@ -282,7 +304,7 @@ class PdkPayjoinDatasource {
     final updatedModel = receiverModel.copyWith(
       receiver: persister.toJson(),
       proposalPsbt: proposalPsbt,
-      txId: await TransactionParsing.getTxIdFromPsbt(proposalPsbt),
+      txId: await _getTxIdFromPsbt(proposalPsbt),
     );
 
     logger.log.info(
@@ -393,9 +415,9 @@ class PdkPayjoinDatasource {
       final persister = ReceiverPersisterAdapter.fromJson(
         receiverModel.receiver,
       );
-      final replayResult = replayReceiverEventLog(persister);
+      final replayResult = pj.replayReceiverEventLog(persister: persister);
       final receiveSession = replayResult.state();
-      if (receiveSession is! InitializedReceiveSession) {
+      if (receiveSession is! pj.InitializedReceiveSession) {
         log(
           '[Receivers Isolate] Expected InitializedReceiveSession but got ${receiveSession.runtimeType}',
         );
@@ -422,16 +444,14 @@ class PdkPayjoinDatasource {
               //  further processing so extract them here and pass them through
               //  the model
               final extractable = request.assumeInteractiveReceiver().save(
-                persister,
+                persister: persister,
               );
               final originalTxBytes =
                   extractable.extractTxToScheduleBroadcast();
               final originalTxId =
-                  await TransactionParsing.getTxIdFromTransactionBytes(
-                    originalTxBytes,
-                  );
+                  await _getTxIdFromTransactionBytes(originalTxBytes);
               final amountSat =
-                  await TransactionParsing.getAmountReceivedFromTransactionBytes(
+                  await _getAmountReceivedFromTransactionBytes(
                     originalTxBytes,
                     address: receiverModel.address,
                     isTestnet: receiverModel.isTestnet,
@@ -489,10 +509,10 @@ class PdkPayjoinDatasource {
         );
         final persister = SenderPersisterAdapter.fromJson(senderModel.sender);
 
-        final replayResult = replaySenderEventLog(persister);
+        final replayResult = pj.replaySenderEventLog(persister: persister);
         final sendSession = replayResult.state();
 
-        if (sendSession is! WithReplyKeySendSession) {
+        if (sendSession is! pj.WithReplyKeySendSession) {
           log(
             '[Senders Isolate] Expected WithReplyKeySendSession but got ${sendSession.runtimeType}',
           );
@@ -501,7 +521,7 @@ class PdkPayjoinDatasource {
 
         final sender = sendSession.inner;
         log('[Senders Isolate] Requesting payjoin...');
-        final context = await PdkPayjoinDatasource.request(
+        final pollingForProposal = await PdkPayjoinDatasource.request(
           sender: sender,
           dio: dio,
           persister: persister,
@@ -514,21 +534,21 @@ class PdkPayjoinDatasource {
           (Timer timer) async {
             log('[Senders Isolate]Checking for proposal in senders isolate');
             try {
-              final proposalPsbt = await PdkPayjoinDatasource.getProposalPsbt(
-                context: context,
+              final proposalPsbtBase64 =
+                  await PdkPayjoinDatasource.getProposalPsbt(
+                pollingForProposal: pollingForProposal,
                 dio: dio,
                 persister: persister,
               );
 
-              if (proposalPsbt != null) {
+              if (proposalPsbtBase64 != null) {
                 log('[Senders Isolate] Proposal found in senders isolate');
-                final psbtStr = proposalPsbt.serializeBase64();
-                final txId = await TransactionParsing.getTxIdFromPsbt(psbtStr);
+                final txId = await _getTxIdFromPsbt(proposalPsbtBase64);
                 // The proposal psbt is needed in the main isolate for
                 //  further processing so send it through the model as well as
                 //  its txId.
                 final updatedModel = senderModel.copyWith(
-                  proposalPsbt: psbtStr,
+                  proposalPsbt: proposalPsbtBase64,
                   txId: txId,
                 );
 
@@ -557,8 +577,8 @@ class PdkPayjoinDatasource {
     });
   }
 
-  static Future<UncheckedOriginalPayload?> getRequest({
-    required Initialized receiver,
+  static Future<pj.UncheckedOriginalPayload?> getRequest({
+    required pj.Initialized receiver,
     required Dio dio,
     required ReceiverPersisterAdapter persister,
   }) async {
@@ -566,10 +586,10 @@ class PdkPayjoinDatasource {
     //  exposes different exceptions for specific errors
     Object? ffiError;
     try {
-      RequestResponse? request;
+      pj.RequestResponse? request;
       for (final ohttpRelay in PayjoinConstants.ohttpRelayUrls) {
         try {
-          request = receiver.createPollRequest(ohttpRelay);
+          request = receiver.createPollRequest(ohttpRelay: ohttpRelay);
           ffiError = null;
           log('receiver extractReq success');
           break;
@@ -599,10 +619,13 @@ class PdkPayjoinDatasource {
       );
       log('processing request...');
       final proposal = receiver
-          .processResponse(ohttpResponse.data as Uint8List, context)
-          .save(persister);
+          .processResponse(
+            body: ohttpResponse.data as Uint8List,
+            ctx: context,
+          )
+          .save(persister: persister);
       log('request processed');
-      if (proposal is ProgressInitializedTransitionOutcome) {
+      if (proposal is pj.ProgressInitializedTransitionOutcome) {
         return proposal.inner;
       } else {
         return null;
@@ -613,18 +636,21 @@ class PdkPayjoinDatasource {
         // TODO: Check for the correct error.
         //  We just assume the error is an expired error for now.
         throw PayjoinExpiredException(
-          'Payjoin receiver $receiver.id() expired',
+          'Payjoin receiver expired',
         );
       }
       return null;
     }
   }
 
-  Future<void> _sendPayjoinProposal(PayjoinProposal proposal) async {
-    RequestResponse? request;
+  Future<void> _sendPayjoinProposal(
+    pj.PayjoinProposal proposal,
+    ReceiverPersisterAdapter persister,
+  ) async {
+    pj.RequestResponse? request;
     for (final ohttpRelayUrl in PayjoinConstants.ohttpRelayUrls) {
       try {
-        request = proposal.createPostRequest(ohttpRelayUrl);
+        request = proposal.createPostRequest(ohttpRelay: ohttpRelayUrl);
         break;
       } catch (e) {
         log('proposal extractReq exception: $e with relay $ohttpRelayUrl');
@@ -644,26 +670,29 @@ class PdkPayjoinDatasource {
         responseType: ResponseType.bytes,
       ),
     );
-    proposal.processResponse(res.data as Uint8List, ohttpCtx);
+    // Save the transition to persist state (e.g. move to Monitor or Closed)
+    proposal.processResponse(
+      body: res.data as Uint8List,
+      ohttpContext: ohttpCtx,
+    ).save(persister: persister);
   }
 
-  static Future<PollingForProposal> request({
-    required WithReplyKey sender,
+  static Future<pj.PollingForProposal> request({
+    required pj.WithReplyKey sender,
     required Dio dio,
     required SenderPersisterAdapter persister,
   }) async {
-    RequestOhttpContext? result;
+    pj.RequestOhttpContext? result;
 
     for (final ohttpProxyUrl in PayjoinConstants.ohttpRelayUrls) {
       try {
         log(
           '[Senders Isolate] Extracting V2 request from sender with relay: $ohttpProxyUrl',
         );
-        result = sender.createV2PostRequest(ohttpProxyUrl);
+        result = sender.createV2PostRequest(ohttpRelay: ohttpProxyUrl);
         break;
       } catch (e) {
-        final msg = (e as dynamic).msg ?? e.toString();
-        log('[Senders Isolate] request error: $msg');
+        log('[Senders Isolate] request error: $e');
         log('[Senders Isolate] Continuing to next OHTTP relay');
         continue;
       }
@@ -688,8 +717,11 @@ class PdkPayjoinDatasource {
     log('[Senders Isolate] Received response from ${req.url}');
 
     final pollingForProposal = sender
-        .processResponse(res.data as Uint8List, context)
-        .save(persister);
+        .processResponse(
+          response: res.data as Uint8List,
+          postCtx: context,
+        )
+        .save(persister: persister);
 
     log(
       '[Senders Isolate] Processed response for V2 request: $pollingForProposal ',
@@ -698,8 +730,10 @@ class PdkPayjoinDatasource {
     return pollingForProposal;
   }
 
-  static Future<Psbt?> getProposalPsbt({
-    required PollingForProposal context,
+  /// Returns the payjoin proposal PSBT as a base64 string, or null if not
+  /// yet available (stasis/polling).
+  static Future<String?> getProposalPsbt({
+    required pj.PollingForProposal pollingForProposal,
     required Dio dio,
     required SenderPersisterAdapter persister,
   }) async {
@@ -707,10 +741,10 @@ class PdkPayjoinDatasource {
     //  exposes different exceptions for specific errors
     Object? ffiError;
     try {
-      RequestOhttpContext? result;
+      pj.RequestOhttpContext? result;
       for (final ohttpRelay in PayjoinConstants.ohttpRelayUrls) {
         try {
-          result = context.createPollRequest(ohttpRelay);
+          result = pollingForProposal.createPollRequest(ohttpRelay: ohttpRelay);
           ffiError = null;
           log(
             'context extract request success: $result with relay $ohttpRelay',
@@ -741,12 +775,16 @@ class PdkPayjoinDatasource {
         ),
       );
 
-      final proposalPsbt = context
-          .processResponse(res.data as Uint8List, reqCtx)
-          .save(persister);
+      final proposalResult = pollingForProposal
+          .processResponse(
+            response: res.data as Uint8List,
+            ohttpCtx: reqCtx,
+          )
+          .save(persister: persister);
 
-      if (proposalPsbt is ProgressPollingForProposalTransitionOutcome) {
-        return proposalPsbt.inner;
+      if (proposalResult is pj.ProgressPollingForProposalTransitionOutcome) {
+        // The psbt is now a base64 String, not a Psbt object
+        return proposalResult.psbtBase64;
       } else {
         return null;
       }
@@ -760,6 +798,30 @@ class PdkPayjoinDatasource {
       return null;
     }
   }
+
+  /// Helper to get txid from PSBT base64 string using BitcoinTx.
+  static Future<String> _getTxIdFromPsbt(String psbtBase64) async {
+    final tx = await BitcoinTx.fromPsbt(psbtBase64);
+    return tx.txid;
+  }
+
+  /// Helper to get txid from raw transaction bytes using BitcoinTx.
+  static Future<String> _getTxIdFromTransactionBytes(
+    Uint8List txBytes,
+  ) async {
+    final tx = await BitcoinTx.fromBytes(txBytes);
+    return tx.txid;
+  }
+
+  /// Helper to get amount received from raw transaction bytes using BitcoinTx.
+  static Future<int> _getAmountReceivedFromTransactionBytes(
+    Uint8List txBytes, {
+    required String address,
+    required bool isTestnet,
+  }) async {
+    final tx = await BitcoinTx.fromBytes(txBytes);
+    return tx.getAmountReceived(address: address, isTestnet: isTestnet);
+  }
 }
 
 /// Temporary adapters for payjoin receiver and sender session persistence.
@@ -771,7 +833,7 @@ class PdkPayjoinDatasource {
 /// Events are also persisted as JSON in the existing PayjoinModel.receiver field
 /// and database. This is a hack but allows upgrading the payjoin dependency without
 /// any database schema changes.
-class ReceiverPersisterAdapter implements JsonReceiverSessionPersister {
+class ReceiverPersisterAdapter implements pj.JsonReceiverSessionPersister {
   final List<String> _events = [];
 
   @override
@@ -801,7 +863,7 @@ class ReceiverPersisterAdapter implements JsonReceiverSessionPersister {
   }
 }
 
-class SenderPersisterAdapter implements JsonSenderSessionPersister {
+class SenderPersisterAdapter implements pj.JsonSenderSessionPersister {
   final List<String> _events = [];
 
   @override
@@ -831,8 +893,10 @@ class SenderPersisterAdapter implements JsonSenderSessionPersister {
   }
 }
 
-// These callback wrappers convert async functions to sync
-class IsScriptOwnedCallback implements IsScriptOwned {
+// These callback wrappers convert async functions to sync as required by
+// the uniffi-generated callback traits. The callbacks return plain values
+// (bool or String), matching the Dart uniffi-generated trait signatures.
+class IsScriptOwnedCallback implements pj.IsScriptOwned {
   final FutureOr<bool> Function(Uint8List) _callback;
 
   IsScriptOwnedCallback(this._callback);
@@ -841,6 +905,9 @@ class IsScriptOwnedCallback implements IsScriptOwned {
   bool callback(Uint8List script) {
     final result = _callback(script);
     if (result is Future<bool>) {
+      // NOTE: This busy-wait pattern is inherited from the original code.
+      // It works because these callbacks run within the FFI boundary synchronously.
+      // A proper fix would use async callbacks if/when the FFI supports them.
       final completer = Completer<bool>();
       result.then(completer.complete).catchError(completer.completeError);
       while (!completer.isCompleted) {}
@@ -850,13 +917,13 @@ class IsScriptOwnedCallback implements IsScriptOwned {
   }
 }
 
-class IsOutputKnownCallback implements IsOutputKnown {
+class IsOutputKnownCallback implements pj.IsOutputKnown {
   final FutureOr<bool> Function(dynamic) _callback;
 
   IsOutputKnownCallback(this._callback);
 
   @override
-  bool callback(OutPoint outpoint) {
+  bool callback(pj.PlainOutPoint outpoint) {
     final result = _callback(outpoint);
     if (result is Future<bool>) {
       final completer = Completer<bool>();
@@ -868,7 +935,7 @@ class IsOutputKnownCallback implements IsOutputKnown {
   }
 }
 
-class ProcessPsbtCallback implements ProcessPsbt {
+class ProcessPsbtCallback implements pj.ProcessPsbt {
   final FutureOr<String> Function(String) _callback;
 
   ProcessPsbtCallback(this._callback);
