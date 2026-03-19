@@ -25,10 +25,11 @@ dependencies:
       ref: f0d4b6cd96b5fbc43d125cd25fb2d38c0241fe9c
       path: flutter_secure_storage
   path_provider: ^2.1.5
-  payjoin_flutter:
+  payjoin:
     git:
-      url: https://github.com/SatoshiPortal/payjoin-flutter
-      ref: 913812dba120703ce9738fa330c5203e1d11f2fa
+      url: https://github.com/payjoin/rust-payjoin
+      ref: 117ce51958974c4893910bec73a47a9f3cade88a
+      path: payjoin-ffi/dart
   qr_flutter: ^4.1.0
   dio: ^5.9.0
   timeago: ^3.7.1
