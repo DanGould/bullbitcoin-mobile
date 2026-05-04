@@ -31,8 +31,13 @@ dependencies:
       path: flutter_secure_storage
   path_provider: ^2.1.5
   shared_preferences: ^2.3.0
+  # TODO: drop this commit and pin to payjoin/rust-payjoin master once
+  # spacebear21/rust-payjoin#dart-fetch-ohttp-keys-https is merged upstream.
   payjoin:
-    path: ../rust-payjoin/payjoin-ffi/dart
+    git:
+      url: https://github.com/spacebear21/rust-payjoin.git
+      ref: 6903cff6e5ded6cda7bed770712e584eb1aa931a
+      path: payjoin-ffi/dart
   qr_flutter: ^4.1.0
   dio: ^5.9.0
   timeago: ^3.7.1
